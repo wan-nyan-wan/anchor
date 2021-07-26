@@ -34,3 +34,4 @@ rand = "0.7.3"
 tar = "0.4.35"
 reqwest = { verson = "0.11.4", features = ["multipart", "blocking"] }
 tokio = "1.0"
+cargo_toml = "0.9.2"

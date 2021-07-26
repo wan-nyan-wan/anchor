@@ -1,11 +1,13 @@
 //! CLI for workspace management of anchor programs.
 
 use crate::config::{Config, Program, ProgramWorkspace, WalletPath};
+use anchor_cli::AnchorPackage;
 use anchor_client::Cluster;
 use anchor_lang::idl::{IdlAccount, IdlInstruction};
 use anchor_lang::{AccountDeserialize, AnchorDeserialize, AnchorSerialize};
 use anchor_syn::idl::Idl;
 use anyhow::{anyhow, Context, Result};
+use cargo_toml::Manifest;
 use clap::Clap;
 use flate2::read::ZlibDecoder;
 use flate2::write::{GzEncoder, ZlibEncoder};
@@ -102,9 +104,7 @@ pub enum Command {
         args: Vec<String>,
     },
     /// Creates a new program.
-    New {
-        name: String,
-    },
+    New { name: String },
     /// Commands for interacting with interface definitions.
     Idl {
         #[clap(subcommand)]
@@ -159,7 +159,11 @@ pub enum Command {
         /// API access token.
         token: String,
     },
-    Publish,
+    /// Publishes a verified build to the Anchor registry.
+    Publish {
+        /// The address to publish the verified build for.
+        address: Pubkey,
+    },
 }
 
 #[derive(Debug, Clap)]
@@ -280,7 +284,7 @@ fn main() -> Result<()> {
         Command::Shell => shell(&opts.cfg_override),
         Command::Run { script } => run(&opts.cfg_override, script),
         Command::Login { token } => login(&opts.cfg_override, token),
-        Command::Publish => publish(&opts.cfg_override),
+        Command::Publish { address } => publish(&opts.cfg_override, address),
     }
 }
 
@@ -1694,7 +1698,7 @@ fn login(_cfg_override: &ConfigOverride, token: String) -> Result<()> {
     Ok(())
 }
 
-fn publish(cfg_override: &ConfigOverride) -> Result<()> {
+fn publish(cfg_override: &ConfigOverride, address: Pubkey) -> Result<()> {
     println!("Assuming workspace layout");
     println!("--programs/");
     println!("--Anchor.toml");
@@ -1702,8 +1706,11 @@ fn publish(cfg_override: &ConfigOverride) -> Result<()> {
     println!("--Cargo.lock");
 
     // Discover the various workspace configs.
-    let (_cfg, cfg_path, cargo) = Config::discover(cfg_override)?.expect("Not in workspace.");
-    let _cargo = cargo.ok_or_else(|| anyhow!("Must be inside program subdirectory."))?;
+    let (_cfg, cfg_path, cargo_path) = Config::discover(cfg_override)?.expect("Not in workspace.");
+    let cargo_path = cargo_path.ok_or_else(|| anyhow!("Must be inside program subdirectory."))?;
+    let manifest = Manifest::from_path(cargo_path)?;
+    let anchor_package = AnchorPackage::from(manifest, address)?;
+    let anchor_package_bytes = serde_json::to_vec(&anchor_package)?;
 
     // Build the program before sending it to the server.
     let local_idl = extract_idl("src/lib.rs")?;
@@ -1727,10 +1734,7 @@ fn publish(cfg_override: &ConfigOverride) -> Result<()> {
     // Upload the tarball to the server.
     let token = registry_api_token(cfg_override)?;
     let form = Form::new()
-        .part("description", {
-            // todo
-            Part::reader(&[1, 2, 3][..])
-        })
+        .part("manifest", Part::bytes(anchor_package_bytes))
         .part("workspace", {
             let file = File::open(&tarball_filename)?;
             Part::reader(file)
