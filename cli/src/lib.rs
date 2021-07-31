@@ -1,28 +1,19 @@
-use anyhow::{anyhow, Result};
-use cargo_toml::Manifest;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AnchorPackage {
     pub name: String,
-    pub description: String,
-    pub license: Option<String>,
     pub address: String,
+    pub path: String,
 }
 
 impl AnchorPackage {
-    pub fn from(manifest: Manifest, address: Pubkey) -> Result<Self> {
-        let package = manifest
-            .package
-            .ok_or(anyhow!("Package section not provided"))?;
-        let description = package
-            .description
-            .ok_or(anyhow!("Description not provided"))?;
+    pub fn from(package: &str, path: &str, address: Pubkey) -> Result<Self> {
         Ok(Self {
-            name: package.name,
-            description,
-            license: package.license,
+            name: package.to_string(),
+            path: path.to_string(),
             address: address.to_string(),
         })
     }

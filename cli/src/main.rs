@@ -7,7 +7,6 @@ use anchor_lang::idl::{IdlAccount, IdlInstruction};
 use anchor_lang::{AccountDeserialize, AnchorDeserialize, AnchorSerialize};
 use anchor_syn::idl::Idl;
 use anyhow::{anyhow, Context, Result};
-use cargo_toml::Manifest;
 use clap::Clap;
 use flate2::read::ZlibDecoder;
 use flate2::write::{GzEncoder, ZlibEncoder};
@@ -161,8 +160,8 @@ pub enum Command {
     },
     /// Publishes a verified build to the Anchor registry.
     Publish {
-        /// The address to publish the verified build for.
-        address: Pubkey,
+        /// The name of the package to publish.
+        package: String,
     },
 }
 
@@ -284,7 +283,7 @@ fn main() -> Result<()> {
         Command::Shell => shell(&opts.cfg_override),
         Command::Run { script } => run(&opts.cfg_override, script),
         Command::Login { token } => login(&opts.cfg_override, token),
-        Command::Publish { address } => publish(&opts.cfg_override, address),
+        Command::Publish { package } => publish(&opts.cfg_override, package),
     }
 }
 
@@ -1698,18 +1697,34 @@ fn login(_cfg_override: &ConfigOverride, token: String) -> Result<()> {
     Ok(())
 }
 
-fn publish(cfg_override: &ConfigOverride, address: Pubkey) -> Result<()> {
-    println!("Assuming workspace layout");
-    println!("--programs/");
-    println!("--Anchor.toml");
-    println!("--Cargo.toml");
-    println!("--Cargo.lock");
-
+fn publish(cfg_override: &ConfigOverride, package: String) -> Result<()> {
     // Discover the various workspace configs.
-    let (_cfg, cfg_path, cargo_path) = Config::discover(cfg_override)?.expect("Not in workspace.");
-    let cargo_path = cargo_path.ok_or_else(|| anyhow!("Must be inside program subdirectory."))?;
-    let manifest = Manifest::from_path(cargo_path)?;
-    let anchor_package = AnchorPackage::from(manifest, address)?;
+    let (cfg, cfg_path, _cargo_path) = Config::discover(cfg_override)?.expect("Not in workspace.");
+
+    let cluster = &cfg.provider.cluster;
+    if cluster != &Cluster::Mainnet {
+        return Err(anyhow!("Publishing requires the mainnet cluster"));
+    }
+
+    let package_details = cfg
+        .programs
+        .get(cluster)
+        .ok_or(anyhow!("Package not provided in Anchor.toml"))?
+        .get(&package)
+        .ok_or(anyhow!("Package not provided in Anchor.toml"))?;
+
+    if true {
+        return Ok(());
+    }
+
+    let anchor_package = AnchorPackage::from(
+        &package,
+        package_details
+            .path
+            .as_ref()
+            .ok_or(anyhow!("Path to program binary not provided"))?,
+        package_details.address,
+    )?;
     let anchor_package_bytes = serde_json::to_vec(&anchor_package)?;
 
     // Build the program before sending it to the server.
@@ -1741,7 +1756,7 @@ fn publish(cfg_override: &ConfigOverride, address: Pubkey) -> Result<()> {
         });
     let client = Client::new();
     let _resp = client
-        .post("http://localhost:8080/api/v0/build")
+        .post(&format!("{}/api/v0/build", cfg.registry.url))
         .bearer_auth(token)
         .multipart(form)
         .send()?;

@@ -15,11 +15,26 @@ use std::str::FromStr;
 
 #[derive(Debug, Default)]
 pub struct Config {
+    pub registry: RegistryConfig,
     pub provider: ProviderConfig,
     pub programs: ProgramsConfig,
     pub scripts: ScriptsConfig,
     pub test: Option<Test>,
     pub workspace: WorkspaceConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RegistryConfig {
+    pub url: String,
+}
+
+impl Default for RegistryConfig {
+    fn default() -> Self {
+        Self {
+            // TODO: use DNS + TLS when ready.
+            url: "http://204.236.190.137".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -152,10 +167,9 @@ impl Config {
     }
 }
 
-// Pubkey serializes as a byte array so use this type a hack to serialize
-// into base 58 strings.
 #[derive(Debug, Serialize, Deserialize)]
 struct _Config {
+    registry: Option<RegistryConfig>,
     provider: Provider,
     test: Option<Test>,
     scripts: Option<ScriptsConfig>,
@@ -180,6 +194,7 @@ impl ToString for Config {
             }
         };
         let cfg = _Config {
+            registry: Some(self.registry.clone()),
             provider: Provider {
                 cluster: format!("{}", self.provider.cluster),
                 wallet: self.provider.wallet.to_string(),
@@ -205,6 +220,7 @@ impl FromStr for Config {
         let cfg: _Config = toml::from_str(s)
             .map_err(|e| anyhow::format_err!("Unable to deserialize config: {}", e.to_string()))?;
         Ok(Config {
+						registry: cfg.registry.unwrap_or(Default::default()),
             provider: ProviderConfig {
                 cluster: cfg.provider.cluster.parse()?,
                 wallet: shellexpand::tilde(&cfg.provider.wallet).parse()?,
@@ -264,6 +280,7 @@ fn deser_programs(
                         ProgramDeployment::try_from(match &program_id {
                             serde_json::Value::String(address) => _ProgramDeployment {
                                 address: address.parse()?,
+                                path: None,
                                 idl: None,
                             },
                             serde_json::Value::Object(_) => {
@@ -342,6 +359,7 @@ impl Program {
 #[derive(Debug, Default)]
 pub struct ProgramDeployment {
     pub address: Pubkey,
+    pub path: Option<String>,
     pub idl: Option<String>,
 }
 
@@ -350,6 +368,7 @@ impl TryFrom<_ProgramDeployment> for ProgramDeployment {
     fn try_from(pd: _ProgramDeployment) -> Result<Self, Self::Error> {
         Ok(ProgramDeployment {
             address: pd.address.parse()?,
+            path: pd.path,
             idl: pd.idl,
         })
     }
@@ -358,6 +377,7 @@ impl TryFrom<_ProgramDeployment> for ProgramDeployment {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct _ProgramDeployment {
     pub address: String,
+    pub path: Option<String>,
     pub idl: Option<String>,
 }
 
@@ -365,6 +385,7 @@ impl From<&ProgramDeployment> for _ProgramDeployment {
     fn from(pd: &ProgramDeployment) -> Self {
         Self {
             address: pd.address.to_string(),
+            path: pd.path.clone(),
             idl: pd.idl.clone(),
         }
     }
