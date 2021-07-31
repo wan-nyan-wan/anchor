@@ -1,7 +1,7 @@
-use crate::ConfigOverride;
 use anchor_client::Cluster;
 use anchor_syn::idl::Idl;
 use anyhow::{anyhow, Error, Result};
+use clap::Clap;
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
@@ -12,6 +12,16 @@ use std::io::prelude::*;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
+
+#[derive(Debug, Clap)]
+pub struct ConfigOverride {
+    /// Cluster override.
+    #[clap(global = true, long = "provider.cluster")]
+    pub cluster: Option<Cluster>,
+    /// Wallet override.
+    #[clap(global = true, long = "provider.wallet")]
+    pub wallet: Option<WalletPath>,
+}
 
 pub struct WithPath<T> {
     inner: T,
@@ -29,6 +39,10 @@ impl<T> WithPath<T> {
 
     pub fn into_inner(self) -> T {
         self.inner
+    }
+
+    pub fn as_ref(&self) -> &T {
+        &self.inner
     }
 }
 
@@ -108,6 +122,7 @@ impl<T> std::ops::DerefMut for WithPath<T> {
 
 #[derive(Debug, Default)]
 pub struct Config {
+    pub anchor_version: Option<String>,
     pub registry: RegistryConfig,
     pub provider: ProviderConfig,
     pub programs: ProgramsConfig,
@@ -219,6 +234,7 @@ impl Config {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct _Config {
+    anchor_version: Option<String>,
     registry: Option<RegistryConfig>,
     provider: Provider,
     test: Option<Test>,
@@ -244,6 +260,7 @@ impl ToString for Config {
             }
         };
         let cfg = _Config {
+            anchor_version: self.anchor_version.clone(),
             registry: Some(self.registry.clone()),
             provider: Provider {
                 cluster: format!("{}", self.provider.cluster),
@@ -270,6 +287,7 @@ impl FromStr for Config {
         let cfg: _Config = toml::from_str(s)
             .map_err(|e| anyhow::format_err!("Unable to deserialize config: {}", e.to_string()))?;
         Ok(Config {
+            anchor_version: cfg.anchor_version,
             registry: cfg.registry.unwrap_or(Default::default()),
             provider: ProviderConfig {
                 cluster: cfg.provider.cluster.parse()?,

@@ -1,7 +1,7 @@
 //! CLI for workspace management of anchor programs.
 
-use crate::config::{Config, Program, ProgramWorkspace, WalletPath, WithPath};
-use anchor_cli::AnchorPackage;
+use anchor_cli::config::{Config, ConfigOverride, Program, ProgramWorkspace, WithPath};
+use anchor_cli::{template, AnchorPackage, DOCKER_BUILDER_VERSION, VERSION};
 use anchor_client::Cluster;
 use anchor_lang::idl::{IdlAccount, IdlInstruction};
 use anchor_lang::{AccountDeserialize, AnchorDeserialize, AnchorSerialize};
@@ -33,13 +33,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::string::ToString;
 
-mod config;
-mod template;
-
-// Version of the docker image.
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-const DOCKER_BUILDER_VERSION: &str = VERSION;
-
 #[derive(Debug, Clap)]
 #[clap(version = VERSION)]
 pub struct Opts {
@@ -47,16 +40,6 @@ pub struct Opts {
     pub cfg_override: ConfigOverride,
     #[clap(subcommand)]
     pub command: Command,
-}
-
-#[derive(Debug, Clap)]
-pub struct ConfigOverride {
-    /// Cluster override.
-    #[clap(global = true, long = "provider.cluster")]
-    cluster: Option<Cluster>,
-    /// Wallet override.
-    #[clap(global = true, long = "provider.wallet")]
-    wallet: Option<WalletPath>,
 }
 
 #[derive(Debug, Clap)]
@@ -390,6 +373,7 @@ fn build(
     program_name: Option<String>,
 ) -> Result<()> {
     let (cfg, _cargo) = Config::discover(cfg_override)?.expect("Not in workspace.");
+
     if let Some(program_name) = program_name {
         for program in cfg.read_all_programs()? {
             let p = program.path.file_name().unwrap().to_str().unwrap();
@@ -412,7 +396,7 @@ fn build(
     };
     match cargo {
         None => build_all(&cfg, cfg.path(), idl_out, verifiable)?,
-        Some(ct) => build_cwd(cfg.path().as_path(), ct, idl_out, verifiable)?,
+        Some(ct) => build_cwd(&cfg, ct, idl_out, verifiable)?,
     };
 
     set_workspace_dir_or_exit();
@@ -431,7 +415,7 @@ fn build_all(
         None => Err(anyhow!("Invalid Anchor.toml at {}", cfg_path.display())),
         Some(_parent) => {
             for p in cfg.get_program_list()? {
-                build_cwd(cfg_path, p.join("Cargo.toml"), idl_out.clone(), verifiable)?;
+                build_cwd(cfg, p.join("Cargo.toml"), idl_out.clone(), verifiable)?;
             }
             Ok(())
         }
@@ -442,7 +426,7 @@ fn build_all(
 
 // Runs the build command outside of a workspace.
 fn build_cwd(
-    cfg_path: &Path,
+    cfg: &WithPath<Config>,
     cargo_toml: PathBuf,
     idl_out: Option<PathBuf>,
     verifiable: bool,
@@ -453,16 +437,22 @@ fn build_cwd(
     };
     match verifiable {
         false => _build_cwd(idl_out),
-        true => build_cwd_verifiable(cfg_path.parent().unwrap()),
+        true => build_cwd_verifiable(cfg),
     }
 }
 
 // Builds an anchor program in a docker image and copies the build artifacts
 // into the `target/` directory.
-fn build_cwd_verifiable(workspace_dir: &Path) -> Result<()> {
+fn build_cwd_verifiable(cfg: &WithPath<Config>) -> Result<()> {
+    let workspace_dir = cfg.path().parent().unwrap();
+    let version = cfg
+        .anchor_version
+        .clone()
+        .unwrap_or(DOCKER_BUILDER_VERSION.to_string());
+
     // Docker vars.
     let container_name = "anchor-program";
-    let image_name = format!("projectserum/build:v{}", DOCKER_BUILDER_VERSION);
+    let image_name = format!("projectserum/build:v{}", version);
     let volume_mount = format!(
         "{}:/workdir",
         workspace_dir.canonicalize()?.display().to_string()
@@ -1694,18 +1684,6 @@ fn publish(cfg_override: &ConfigOverride, program_name: String) -> Result<()> {
     // Discover the various workspace configs.
     let (cfg, _cargo_path) = Config::discover(cfg_override)?.expect("Not in workspace.");
 
-    let cluster = &cfg.provider.cluster;
-    if cluster != &Cluster::Mainnet {
-        return Err(anyhow!("Publishing requires the mainnet cluster"));
-    }
-
-    let program_details = cfg
-        .programs
-        .get(cluster)
-        .ok_or(anyhow!("Program not provided in Anchor.toml"))?
-        .get(&program_name)
-        .ok_or(anyhow!("Program not provided in Anchor.toml"))?;
-
     println!("Publishing will make your code public. Are you sure? Enter (yes)/no:");
 
     let answer = std::io::stdin().lock().lines().next().unwrap().unwrap();
@@ -1714,14 +1692,7 @@ fn publish(cfg_override: &ConfigOverride, program_name: String) -> Result<()> {
         return Ok(());
     }
 
-    let anchor_package = AnchorPackage::from(
-        &program_name,
-        program_details
-            .path
-            .as_ref()
-            .ok_or(anyhow!("Path to program binary not provided"))?,
-        program_details.address,
-    )?;
+    let anchor_package = AnchorPackage::from(program_name.clone(), &cfg)?;
     let anchor_package_bytes = serde_json::to_vec(&anchor_package)?;
 
     // Build the program before sending it to the server.
