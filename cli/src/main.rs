@@ -1714,11 +1714,6 @@ fn publish(cfg_override: &ConfigOverride, program_name: String) -> Result<()> {
         return Ok(());
     }
 
-    if true {
-        println!("CFG: {:?}", cfg.into_inner());
-        return Ok(());
-    }
-
     let anchor_package = AnchorPackage::from(
         &program_name,
         program_details
@@ -1730,7 +1725,6 @@ fn publish(cfg_override: &ConfigOverride, program_name: String) -> Result<()> {
     let anchor_package_bytes = serde_json::to_vec(&anchor_package)?;
 
     // Build the program before sending it to the server.
-    let local_idl = extract_idl("src/lib.rs")?;
     build(cfg_override, None, false, None)?;
 
     // Set directory to top of the workspace.
@@ -1738,16 +1732,15 @@ fn publish(cfg_override: &ConfigOverride, program_name: String) -> Result<()> {
     std::env::set_current_dir(workspace_dir)?;
 
     // Create the workspace tarball.
-    let tarball_filename = workspace_dir.join(format!("{}.tar.gz", local_idl.name));
+    let dot_anchor = workspace_dir.join(".anchor");
+    fs::create_dir_all(&dot_anchor)?;
+    let tarball_filename = dot_anchor.join(format!("{}.tar.gz", program_name));
     let tar_gz = File::create(&tarball_filename)?;
     let enc = GzEncoder::new(tar_gz, Compression::default());
     let mut tar = tar::Builder::new(enc);
 
     // Files that will always be included if they exist.
     tar.append_path("Anchor.toml")?;
-    if Path::new("programs").exists() {
-        tar.append_dir_all("programs", workspace_dir.join("programs"))?;
-    }
     if Path::new("Cargo.toml").exists() {
         tar.append_path("Cargo.toml")?;
     }
@@ -1758,16 +1751,15 @@ fn publish(cfg_override: &ConfigOverride, program_name: String) -> Result<()> {
         tar.append_path("LICENSE")?;
     }
     if Path::new("README.md").exists() {
-        tar.append_path("LICENSE")?;
+        tar.append_path("README.md")?;
     }
 
-    // Files specified.
-    /*    if let Some(members) = cfg.get_program_list() {
-            for f in files {
-                tar.append_path(&f)?;
-            }
-        }
-    */
+    // All workspace programs.
+    for path in cfg.get_program_list()? {
+        let relative_path = pathdiff::diff_paths(path, cfg.path().parent().unwrap())
+            .ok_or(anyhow!("Unable to diff paths"))?;
+        tar.append_dir_all(relative_path.clone(), relative_path)?;
+    }
 
     tar.into_inner()?;
 
