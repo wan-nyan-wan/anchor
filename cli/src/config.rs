@@ -13,19 +13,113 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+pub struct WithPath<T> {
+    inner: T,
+    path: PathBuf,
+}
+
+impl<T> WithPath<T> {
+    pub fn new(inner: T, path: PathBuf) -> Self {
+        Self { inner, path }
+    }
+
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
+impl WithPath<Config> {
+    pub fn get_program_list(&self) -> Result<Vec<PathBuf>> {
+        // Canopnicalize the workspace filepaths to compare with relative paths.
+        let (members, exclude) = self.canonicalize_workspace()?;
+
+        // Get all candidate programs.
+        //
+        // If [workspace.members] exists, then use that.
+        // Otherwise, default to `programs/*`.
+        let program_paths: Vec<PathBuf> = {
+            if members.is_empty() {
+                let path = self.path().parent().unwrap().join("programs");
+                fs::read_dir(path)?
+                    .map(|dir| dir.map(|d| d.path().canonicalize().unwrap()))
+                    .collect::<Vec<Result<PathBuf, std::io::Error>>>()
+                    .into_iter()
+                    .collect::<Result<Vec<PathBuf>, std::io::Error>>()?
+            } else {
+                members
+            }
+        };
+
+        // Filter out everything part of the exclude array.
+        Ok(program_paths
+            .into_iter()
+            .filter(|m| !exclude.contains(m))
+            .collect())
+    }
+
+    // TODO: this should read idl dir instead of parsing source.
+    pub fn read_all_programs(&self) -> Result<Vec<Program>> {
+        let mut r = vec![];
+        for path in self.get_program_list()? {
+            let idl = anchor_syn::idl::file::parse(path.join("src/lib.rs"))?;
+            let lib_name = extract_lib_name(&path.join("Cargo.toml"))?;
+            r.push(Program {
+                lib_name,
+                path,
+                idl,
+            });
+        }
+        Ok(r)
+    }
+
+    pub fn canonicalize_workspace(&self) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+        let members = self
+            .workspace
+            .members
+            .iter()
+            .map(|m| PathBuf::from(m).canonicalize().unwrap())
+            .collect();
+        let exclude = self
+            .workspace
+            .exclude
+            .iter()
+            .map(|m| PathBuf::from(m).canonicalize().unwrap())
+            .collect();
+        Ok((members, exclude))
+    }
+}
+
+impl<T> std::ops::Deref for WithPath<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<T> std::ops::DerefMut for WithPath<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Config {
     pub registry: RegistryConfig,
     pub provider: ProviderConfig,
     pub programs: ProgramsConfig,
     pub scripts: ScriptsConfig,
-    pub test: Option<Test>,
     pub workspace: WorkspaceConfig,
+    pub test: Option<Test>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RegistryConfig {
     pub url: String,
+    pub files: Option<Vec<String>>, // todo: remove
 }
 
 impl Default for RegistryConfig {
@@ -33,6 +127,7 @@ impl Default for RegistryConfig {
         Self {
             // TODO: use DNS + TLS when ready.
             url: "http://204.236.190.137".to_string(),
+            files: None,
         }
     }
 }
@@ -58,9 +153,9 @@ pub struct WorkspaceConfig {
 impl Config {
     pub fn discover(
         cfg_override: &ConfigOverride,
-    ) -> Result<Option<(Self, PathBuf, Option<PathBuf>)>> {
+    ) -> Result<Option<(WithPath<Config>, Option<PathBuf>)>> {
         Config::_discover().map(|opt| {
-            opt.map(|(mut cfg, cfg_path, cargo_toml)| {
+            opt.map(|(mut cfg, cargo_toml)| {
                 if let Some(cluster) = cfg_override.cluster.clone() {
                     cfg.provider.cluster = cluster;
                 }
@@ -68,13 +163,13 @@ impl Config {
                 if let Some(wallet) = cfg_override.wallet.clone() {
                     cfg.provider.wallet = wallet;
                 }
-                (cfg, cfg_path, cargo_toml)
+                (cfg, cargo_toml)
             })
         })
     }
 
     // Searches all parent directories for an Anchor.toml file.
-    fn _discover() -> Result<Option<(Self, PathBuf, Option<PathBuf>)>> {
+    fn _discover() -> Result<Option<(WithPath<Config>, Option<PathBuf>)>> {
         // Set to true if we ever see a Cargo.toml file when traversing the
         // parent directories.
         let mut cargo_toml = None;
@@ -103,7 +198,7 @@ impl Config {
             }
 
             if let Some((cfg, parent)) = anchor_toml {
-                return Ok(Some((cfg, parent, cargo_toml)));
+                return Ok(Some((WithPath::new(cfg, parent.clone()), cargo_toml)));
             }
 
             if cargo_toml.is_none() {
@@ -119,51 +214,6 @@ impl Config {
     pub fn wallet_kp(&self) -> Result<Keypair> {
         solana_sdk::signature::read_keypair_file(&self.provider.wallet.to_string())
             .map_err(|_| anyhow!("Unable to read keypair file"))
-    }
-
-    pub fn get_program_list(&self, path: PathBuf) -> Result<Vec<PathBuf>> {
-        let mut programs = vec![];
-        for f in fs::read_dir(path)? {
-            let path = f?.path();
-            let program = path
-                .components()
-                .last()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .expect("failed to get program from path");
-
-            match (
-                self.workspace.members.is_empty(),
-                self.workspace.exclude.is_empty(),
-            ) {
-                (true, true) => programs.push(path),
-                (true, false) => {
-                    if !self.workspace.exclude.contains(&program) {
-                        programs.push(path);
-                    }
-                }
-                (false, _) => {
-                    if self.workspace.members.contains(&program) {
-                        programs.push(path);
-                    }
-                }
-            }
-        }
-        Ok(programs)
-    }
-
-    // TODO: this should read idl dir instead of parsing source.
-    pub fn read_all_programs(&self) -> Result<Vec<Program>> {
-        let mut r = vec![];
-        for path in self.get_program_list("programs".into())? {
-            let idl = anchor_syn::idl::file::parse(path.join("src/lib.rs"))?;
-            let lib_name = extract_lib_name(&path.join("Cargo.toml"))?;
-            r.push(Program {
-                lib_name,
-                path,
-                idl,
-            });
-        }
-        Ok(r)
     }
 }
 
@@ -220,7 +270,7 @@ impl FromStr for Config {
         let cfg: _Config = toml::from_str(s)
             .map_err(|e| anyhow::format_err!("Unable to deserialize config: {}", e.to_string()))?;
         Ok(Config {
-						registry: cfg.registry.unwrap_or(Default::default()),
+            registry: cfg.registry.unwrap_or(Default::default()),
             provider: ProviderConfig {
                 cluster: cfg.provider.cluster.parse()?,
                 wallet: shellexpand::tilde(&cfg.provider.wallet).parse()?,
@@ -228,19 +278,7 @@ impl FromStr for Config {
             scripts: cfg.scripts.unwrap_or_else(BTreeMap::new),
             test: cfg.test,
             programs: cfg.programs.map_or(Ok(BTreeMap::new()), deser_programs)?,
-            workspace: cfg.workspace.map(|workspace| {
-                let (members, exclude) = match (workspace.members.is_empty(), workspace.exclude.is_empty()) {
-                    (true, true) => (vec![], vec![]),
-                    (true, false) => (vec![], workspace.exclude),
-                    (false, is_empty) => {
-                        if !is_empty {
-                            println!("Fields `members` and `exclude` in `[workspace]` section are not compatible, only `members` will be used.");
-                        }
-                        (workspace.members, vec![])
-                    }
-                };
-                WorkspaceConfig { members, exclude }
-            }).unwrap_or_default()
+            workspace: cfg.workspace.unwrap_or_default(),
         })
     }
 }
