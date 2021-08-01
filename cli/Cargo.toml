@@ -6,7 +6,7 @@ edition = "2018"
 
 [[bin]]
 name = "anchor"
-path = "src/main.rs"
+path = "src/bin/main.rs"
 
 [features]
 dev = []

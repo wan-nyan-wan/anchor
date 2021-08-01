@@ -134,15 +134,12 @@ pub struct Config {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RegistryConfig {
     pub url: String,
-    pub files: Option<Vec<String>>, // todo: remove
 }
 
 impl Default for RegistryConfig {
     fn default() -> Self {
         Self {
-            // TODO: use DNS + TLS when ready.
-            url: "http://204.236.190.137".to_string(),
-            files: None,
+            url: "https://anchor.projectserum.com".to_string(),
         }
     }
 }
@@ -451,6 +448,38 @@ pub struct ProgramWorkspace {
     pub name: String,
     pub program_id: Pubkey,
     pub idl: Idl,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AnchorPackage {
+    pub name: String,
+    pub address: String,
+    pub path: String,
+}
+
+impl AnchorPackage {
+    pub fn from(name: String, cfg: &WithPath<Config>) -> Result<Self> {
+        let cluster = &cfg.provider.cluster;
+        if cluster != &Cluster::Mainnet {
+            return Err(anyhow!("Publishing requires the mainnet cluster"));
+        }
+        let program_details = cfg
+            .programs
+            .get(cluster)
+            .ok_or(anyhow!("Program not provided in Anchor.toml"))?
+            .get(&name)
+            .ok_or(anyhow!("Program not provided in Anchor.toml"))?;
+        let path = program_details
+            .path
+            .clone()
+            .ok_or(anyhow!("Path to program binary not provided"))?;
+        let address = program_details.address.to_string();
+        Ok(Self {
+            name,
+            path,
+            address,
+        })
+    }
 }
 
 serum_common::home_path!(WalletPath, ".config/solana/id.json");
