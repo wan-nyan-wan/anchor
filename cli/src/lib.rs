@@ -440,13 +440,13 @@ fn build_cwd(
     };
     match verifiable {
         false => _build_cwd(idl_out),
-        true => build_cwd_verifiable(cfg),
+        true => build_cwd_verifiable(cfg, cargo_toml),
     }
 }
 
 // Builds an anchor program in a docker image and copies the build artifacts
 // into the `target/` directory.
-fn build_cwd_verifiable(cfg: &WithPath<Config>) -> Result<()> {
+fn build_cwd_verifiable(cfg: &WithPath<Config>, cargo_toml: PathBuf) -> Result<()> {
     let workspace_dir = cfg.path().parent().unwrap();
     let version = cfg
         .anchor_version
@@ -486,11 +486,25 @@ fn build_cwd_verifiable(cfg: &WithPath<Config>) -> Result<()> {
         return Ok(());
     }
 
-    let idl = extract_idl("src/lib.rs")?;
+    let binary_name = {
+        let cargo_toml = cargo_toml::Manifest::from_path(cargo_toml)?;
+        match cargo_toml.lib {
+            None => {
+                cargo_toml
+                    .package
+                    .ok_or(anyhow!("Package section not provided"))?
+                    .name
+            }
+            Some(lib) => lib.name.ok_or(anyhow!("Name not provided"))?,
+        }
+    };
 
     // Copy the binary out of the docker image.
-    let out_file = format!("../../target/deploy/{}.so", idl.name);
-    let bin_artifact = format!("{}:/workdir/target/deploy/{}.so", container_name, idl.name);
+    let out_file = format!("../../target/deploy/{}.so", binary_name);
+    let bin_artifact = format!(
+        "{}:/workdir/target/deploy/{}.so",
+        container_name, binary_name
+    );
     let exit = std::process::Command::new("docker")
         .args(&["cp", &bin_artifact, &out_file])
         .stdout(Stdio::inherit())
@@ -502,16 +516,18 @@ fn build_cwd_verifiable(cfg: &WithPath<Config>) -> Result<()> {
     }
 
     // Copy the idl out of the docker image.
-    let out_file = format!("../../target/idl/{}.json", idl.name);
-    let idl_artifact = format!("{}:/workdir/target/idl/{}.json", container_name, idl.name);
-    let exit = std::process::Command::new("docker")
-        .args(&["cp", &idl_artifact, &out_file])
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .output()
-        .map_err(|e| anyhow::format_err!("{}", e.to_string()))?;
-    if !exit.status.success() {
-        return Ok(());
+    if let Some(idl) = extract_idl("src/lib.rs")? {
+        let out_file = format!("../../target/idl/{}.json", idl.name);
+        let idl_artifact = format!("{}:/workdir/target/idl/{}.json", container_name, idl.name);
+        let exit = std::process::Command::new("docker")
+            .args(&["cp", &idl_artifact, &out_file])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .output()
+            .map_err(|e| anyhow::format_err!("{}", e.to_string()))?;
+        if !exit.status.success() {
+            return Ok(());
+        }
     }
 
     // Remove the docker image.
@@ -540,14 +556,16 @@ fn _build_cwd(idl_out: Option<PathBuf>) -> Result<()> {
     }
 
     // Always assume idl is located ar src/lib.rs.
-    let idl = extract_idl("src/lib.rs")?;
+    if let Some(idl) = extract_idl("src/lib.rs")? {
+        let out = match idl_out {
+            None => PathBuf::from(".").join(&idl.name).with_extension("json"),
+            Some(o) => PathBuf::from(&o.join(&idl.name).with_extension("json")),
+        };
 
-    let out = match idl_out {
-        None => PathBuf::from(".").join(&idl.name).with_extension("json"),
-        Some(o) => PathBuf::from(&o.join(&idl.name).with_extension("json")),
-    };
+        write_idl(&idl, OutFile::File(out))?;
+    }
 
-    write_idl(&idl, OutFile::File(out))
+    Ok(())
 }
 
 fn verify(cfg_override: &ConfigOverride, program_id: Pubkey) -> Result<()> {
@@ -560,21 +578,33 @@ fn verify(cfg_override: &ConfigOverride, program_id: Pubkey) -> Result<()> {
     build(cfg_override, None, true, None)?;
     std::env::set_current_dir(&cur_dir)?;
 
-    let local_idl = extract_idl("src/lib.rs")?;
-
     // Verify binary.
+    let binary_name = {
+        let cargo_toml = cargo_toml::Manifest::from_path(&cargo)?;
+        match cargo_toml.lib {
+            None => {
+                cargo_toml
+                    .package
+                    .ok_or(anyhow!("Package section not provided"))?
+                    .name
+            }
+            Some(lib) => lib.name.ok_or(anyhow!("Name not provided"))?,
+        }
+    };
     let bin_path = program_dir
         .join("../../target/deploy/")
-        .join(format!("{}.so", local_idl.name));
+        .join(format!("{}.so", binary_name));
     let is_buffer = verify_bin(program_id, &bin_path, cfg.provider.cluster.url())?;
 
     // Verify IDL (only if it's not a buffer account).
-    if !is_buffer {
-        std::env::set_current_dir(program_dir)?;
-        let deployed_idl = fetch_idl(cfg_override, program_id)?;
-        if local_idl != deployed_idl {
-            println!("Error: IDLs don't match");
-            std::process::exit(1);
+    if let Some(local_idl) = extract_idl("src/lib.rs")? {
+        if !is_buffer {
+            std::env::set_current_dir(program_dir)?;
+            let deployed_idl = fetch_idl(cfg_override, program_id)?;
+            if local_idl != deployed_idl {
+                println!("Error: IDLs don't match");
+                std::process::exit(1);
+            }
         }
     }
 
@@ -663,7 +693,7 @@ fn fetch_idl(cfg_override: &ConfigOverride, idl_addr: Pubkey) -> Result<Idl> {
     serde_json::from_slice(&s[..]).map_err(Into::into)
 }
 
-fn extract_idl(file: &str) -> Result<Idl> {
+fn extract_idl(file: &str) -> Result<Option<Idl>> {
     let file = shellexpand::tilde(file);
     anchor_syn::idl::file::parse(&*file)
 }
@@ -948,7 +978,7 @@ fn idl_write(cfg: &Config, program_id: &Pubkey, idl: &Idl, idl_address: Pubkey) 
 }
 
 fn idl_parse(file: String, out: Option<String>) -> Result<()> {
-    let idl = extract_idl(&file)?;
+    let idl = extract_idl(&file)?.ok_or(anyhow!("IDL not parsed"))?;
     let out = match out {
         None => OutFile::Stdout,
         Some(out) => OutFile::File(PathBuf::from(out)),
@@ -1075,7 +1105,7 @@ fn genesis_flags(cfg: &WithPath<Config>) -> Result<Vec<String>> {
         let binary_path = program.binary_path().display().to_string();
 
         let address = programs
-            .and_then(|m| m.get(&program.idl.name))
+            .and_then(|m| m.get(&program.lib_name))
             .map(|deployment| deployment.address.to_string())
             .unwrap_or_else(|| {
                 let kp = Keypair::generate(&mut OsRng);
@@ -1086,14 +1116,16 @@ fn genesis_flags(cfg: &WithPath<Config>) -> Result<Vec<String>> {
         flags.push(address.clone());
         flags.push(binary_path);
 
-        // Add program address to the IDL.
-        program.idl.metadata = Some(serde_json::to_value(IdlTestMetadata { address })?);
+        if let Some(mut idl) = program.idl.as_mut() {
+            // Add program address to the IDL.
+            idl.metadata = Some(serde_json::to_value(IdlTestMetadata { address })?);
 
-        // Persist it.
-        let idl_out = PathBuf::from("target/idl")
-            .join(&program.idl.name)
-            .with_extension("json");
-        write_idl(&program.idl, OutFile::File(idl_out))?;
+            // Persist it.
+            let idl_out = PathBuf::from("target/idl")
+                .join(&idl.name)
+                .with_extension("json");
+            write_idl(&idl, OutFile::File(idl_out))?;
+        }
     }
     if let Some(test) = cfg.test.as_ref() {
         for entry in &test.genesis {
@@ -1124,7 +1156,7 @@ fn stream_logs(config: &WithPath<Config>) -> Result<Vec<std::process::Child>> {
 
         let log_file = File::create(format!(
             "{}/{}.{}.log",
-            program_logs_dir, metadata.address, program.idl.name
+            program_logs_dir, metadata.address, program.lib_name,
         ))?;
         let stdio = std::process::Stdio::from(log_file);
         let child = std::process::Command::new("solana")
@@ -1249,16 +1281,18 @@ fn _deploy(
                 std::process::exit(exit.status.code().unwrap_or(1));
             }
 
-            // Add program address to the IDL.
-            program.idl.metadata = Some(serde_json::to_value(IdlTestMetadata {
-                address: program_kp.pubkey().to_string(),
-            })?);
+            if let Some(mut idl) = program.idl.as_mut() {
+                // Add program address to the IDL.
+                idl.metadata = Some(serde_json::to_value(IdlTestMetadata {
+                    address: program_kp.pubkey().to_string(),
+                })?);
 
-            // Persist it.
-            let idl_out = PathBuf::from("target/idl")
-                .join(&program.idl.name)
-                .with_extension("json");
-            write_idl(&program.idl, OutFile::File(idl_out))?;
+                // Persist it.
+                let idl_out = PathBuf::from("target/idl")
+                    .join(&idl.name)
+                    .with_extension("json");
+                write_idl(&idl, OutFile::File(idl_out))?;
+            }
 
             programs.push((program_kp.pubkey(), program))
         }
@@ -1314,9 +1348,11 @@ fn launch(
 
         // Add metadata to all IDLs.
         for (address, program) in programs {
-            // Store the IDL on chain.
-            let idl_address = create_idl_account(cfg, &keypair, &address, &program.idl)?;
-            println!("IDL account created: {}", idl_address.to_string());
+            if let Some(idl) = program.idl.as_ref() {
+                // Store the IDL on chain.
+                let idl_address = create_idl_account(cfg, &keypair, &address, idl)?;
+                println!("IDL account created: {}", idl_address.to_string());
+            }
         }
 
         // Run migration script.
@@ -1592,10 +1628,17 @@ fn cluster(_cmd: ClusterCommand) -> Result<()> {
 fn shell(cfg_override: &ConfigOverride) -> Result<()> {
     with_workspace(cfg_override, |cfg, _cargo| {
         let programs = {
+            // Create idl map from all workspace programs.
             let mut idls: HashMap<String, Idl> = cfg
                 .read_all_programs()?
                 .iter()
-                .map(|program| (program.idl.name.clone(), program.idl.clone()))
+                .filter(|program| program.idl.is_some())
+                .map(|program| {
+                    (
+                        program.idl.as_ref().unwrap().name.clone(),
+                        program.idl.clone().unwrap(),
+                    )
+                })
                 .collect();
             // Insert all manually specified idls into the idl map.
             if let Some(programs) = cfg.programs.get(&cfg.provider.cluster) {
@@ -1611,20 +1654,20 @@ fn shell(cfg_override: &ConfigOverride) -> Result<()> {
                     })
                     .collect::<Vec<_>>();
             }
+            // Finalize program list with all programs with IDLs.
             match cfg.programs.get(&cfg.provider.cluster) {
                 None => Vec::new(),
                 Some(programs) => programs
                     .iter()
-                    .map(|(name, program_deployment)| ProgramWorkspace {
-                        name: name.to_string(),
-                        program_id: program_deployment.address,
-                        idl: match idls.get(name) {
-                            None => {
-                                println!("Unable to find IDL for {}", name);
-                                std::process::exit(1);
-                            }
-                            Some(idl) => idl.clone(),
-                        },
+                    .filter_map(|(name, program_deployment)| {
+                        Some(ProgramWorkspace {
+                            name: name.to_string(),
+                            program_id: program_deployment.address,
+                            idl: match idls.get(name) {
+                                None => return None,
+                                Some(idl) => idl.clone(),
+                            },
+                        })
                     })
                     .collect::<Vec<ProgramWorkspace>>(),
             }

@@ -363,6 +363,7 @@ pub struct GenesisEntry {
     pub program: String,
 }
 
+// TODO: Just use the cargo_toml crate for this.
 pub fn extract_lib_name(path: impl AsRef<Path>) -> Result<String> {
     let mut toml = File::open(path)?;
     let mut contents = String::new();
@@ -389,7 +390,7 @@ pub fn extract_lib_name(path: impl AsRef<Path>) -> Result<String> {
 pub struct Program {
     pub lib_name: String,
     pub path: PathBuf,
-    pub idl: Idl,
+    pub idl: Option<Idl>,
 }
 
 impl Program {
