@@ -238,7 +238,7 @@ pub fn entry(opts: Opts) -> Result<()> {
             idl,
             verifiable,
             program_name,
-        } => build(&opts.cfg_override, idl, verifiable, program_name),
+        } => build(&opts.cfg_override, idl, verifiable, program_name, None),
         Command::Verify { program_id } => verify(&opts.cfg_override, program_id),
         Command::Deploy { program_name } => deploy(&opts.cfg_override, program_name),
         Command::Upgrade {
@@ -369,23 +369,48 @@ fn new_program(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn build(
+pub fn build(
     cfg_override: &ConfigOverride,
     idl: Option<String>,
     verifiable: bool,
     program_name: Option<String>,
+    stderr: Option<File>, // Used for the package registry server.
 ) -> Result<()> {
+    // Change directories to the given `program_name`, if given.
     let (cfg, _cargo) = Config::discover(cfg_override)?.expect("Not in workspace.");
-
-    if let Some(program_name) = program_name {
+    let mut did_find_program = false;
+    if let Some(program_name) = program_name.as_ref() {
         for program in cfg.read_all_programs()? {
-            let p = program.path.file_name().unwrap().to_str().unwrap();
-            if program_name.as_str() == p {
-                std::env::set_current_dir(&program.path)?;
+            let cargo_toml = program.path.join("Cargo.toml");
+            if !cargo_toml.exists() {
+                return Err(anyhow!(
+                    "Did not find Cargo.toml at the path: {}",
+                    program.path.display()
+                ));
+            }
+            let p_lib_name = config::extract_lib_name(&cargo_toml)?;
+            if program_name.as_str() == p_lib_name {
+                let program_path = cfg
+                    .path()
+                    .parent()
+                    .unwrap()
+                    .canonicalize()?
+                    .join(program.path);
+                std::env::set_current_dir(&program_path)?;
+                did_find_program = true;
+                break;
             }
         }
     }
+    if !did_find_program && program_name.is_some() {
+        return Err(anyhow!(
+            "{} is not part of the workspace",
+            program_name.as_ref().unwrap()
+        ));
+    }
+
     let (cfg, cargo) = Config::discover(cfg_override)?.expect("Not in workspace.");
+
     let idl_out = match idl {
         Some(idl) => Some(PathBuf::from(idl)),
         None => {
@@ -399,7 +424,7 @@ fn build(
     };
     match cargo {
         None => build_all(&cfg, cfg.path(), idl_out, verifiable)?,
-        Some(ct) => build_cwd(&cfg, ct, idl_out, verifiable)?,
+        Some(ct) => build_cwd(&cfg, ct, idl_out, verifiable, stderr)?,
     };
 
     set_workspace_dir_or_exit();
@@ -418,7 +443,7 @@ fn build_all(
         None => Err(anyhow!("Invalid Anchor.toml at {}", cfg_path.display())),
         Some(_parent) => {
             for p in cfg.get_program_list()? {
-                build_cwd(cfg, p.join("Cargo.toml"), idl_out.clone(), verifiable)?;
+                build_cwd(cfg, p.join("Cargo.toml"), idl_out.clone(), verifiable, None)?;
             }
             Ok(())
         }
@@ -433,6 +458,7 @@ fn build_cwd(
     cargo_toml: PathBuf,
     idl_out: Option<PathBuf>,
     verifiable: bool,
+    stderr: Option<File>,
 ) -> Result<()> {
     match cargo_toml.parent() {
         None => return Err(anyhow!("Unable to find parent")),
@@ -440,30 +466,66 @@ fn build_cwd(
     };
     match verifiable {
         false => _build_cwd(idl_out),
-        true => build_cwd_verifiable(cfg, cargo_toml),
+        true => build_cwd_verifiable(cfg, cargo_toml, stderr),
     }
 }
 
 // Builds an anchor program in a docker image and copies the build artifacts
 // into the `target/` directory.
-fn build_cwd_verifiable(cfg: &WithPath<Config>, cargo_toml: PathBuf) -> Result<()> {
+fn build_cwd_verifiable(
+    cfg: &WithPath<Config>,
+    cargo_toml: PathBuf,
+    stderr: Option<File>,
+) -> Result<()> {
+    // Create output dirs.
     let workspace_dir = cfg.path().parent().unwrap();
+    fs::create_dir_all(workspace_dir.join("target/deploy"))?;
+    fs::create_dir_all(workspace_dir.join("target/idl"))?;
+
+    let container_name = "anchor-program";
+
+    // Build the binary in docker.
+    let result = docker_build(cfg, &container_name, cargo_toml, stderr);
+
+    // Remove the docker image.
+    let exit = std::process::Command::new("docker")
+        .args(&["rm", container_name])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| anyhow::format_err!("{}", e.to_string()))?;
+    if !exit.status.success() {
+        println!("Unable to remove docker container");
+        std::process::exit(exit.status.code().unwrap_or(1));
+    }
+
+    // Build the idl.
+    if let Some(idl) = extract_idl("src/lib.rs")? {
+        let out_file = format!("../../target/idl/{}.json", idl.name);
+        write_idl(&idl, OutFile::File(out_file.into()))?;
+    }
+
+    result
+}
+
+fn docker_build(
+    cfg: &WithPath<Config>,
+    container_name: &str,
+    cargo_toml: PathBuf,
+    stderr: Option<File>,
+) -> Result<()> {
+    let binary_name = config::extract_lib_name(&cargo_toml)?;
+
+    // Docker vars.
     let version = cfg
         .anchor_version
         .clone()
         .unwrap_or(DOCKER_BUILDER_VERSION.to_string());
-
-    // Docker vars.
-    let container_name = "anchor-program";
     let image_name = format!("projectserum/build:v{}", version);
     let volume_mount = format!(
         "{}:/workdir",
-        workspace_dir.canonicalize()?.display().to_string()
+        cfg.path().parent().unwrap().canonicalize()?.display()
     );
-
-    // Create output dirs.
-    fs::create_dir_all(workspace_dir.join("target/deploy"))?;
-    fs::create_dir_all(workspace_dir.join("target/idl"))?;
 
     // Build the program in docker.
     let exit = std::process::Command::new("docker")
@@ -476,31 +538,32 @@ fn build_cwd_verifiable(cfg: &WithPath<Config>, cargo_toml: PathBuf) -> Result<(
             &image_name,
             "anchor",
             "build",
+            "-p",
+            &binary_name,
         ])
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(match stderr {
+            None => Stdio::inherit(),
+            Some(f) => f.into(),
+        })
         .output()
-        .map_err(|e| anyhow::format_err!("{}", e.to_string()))?;
+        .map_err(|e| anyhow::format_err!("Docker build failed: {}", e.to_string()))?;
     if !exit.status.success() {
-        println!("Error building program");
-        return Ok(());
+        return Err(anyhow!("Failed to build program"));
     }
 
-    let binary_name = {
-        let cargo_toml = cargo_toml::Manifest::from_path(cargo_toml)?;
-        match cargo_toml.lib {
-            None => {
-                cargo_toml
-                    .package
-                    .ok_or(anyhow!("Package section not provided"))?
-                    .name
-            }
-            Some(lib) => lib.name.ok_or(anyhow!("Name not provided"))?,
-        }
-    };
-
     // Copy the binary out of the docker image.
-    let out_file = format!("../../target/deploy/{}.so", binary_name);
+    let out_file = cfg
+        .path()
+        .parent()
+        .unwrap()
+        .canonicalize()?
+        .join(format!("target/deploy/{}.so", binary_name))
+        .display()
+        .to_string();
+
+    // This requires the target directory of any built program to be located at
+    // the root of the workspace.
     let bin_artifact = format!(
         "{}:/workdir/target/deploy/{}.so",
         container_name, binary_name
@@ -512,35 +575,12 @@ fn build_cwd_verifiable(cfg: &WithPath<Config>, cargo_toml: PathBuf) -> Result<(
         .output()
         .map_err(|e| anyhow::format_err!("{}", e.to_string()))?;
     if !exit.status.success() {
-        return Ok(());
+        return Err(anyhow!(
+            "Failed to copy binary out of docker. Is the target directory set correctly?"
+        ));
     }
 
-    // Copy the idl out of the docker image.
-    if let Some(idl) = extract_idl("src/lib.rs")? {
-        let out_file = format!("../../target/idl/{}.json", idl.name);
-        let idl_artifact = format!("{}:/workdir/target/idl/{}.json", container_name, idl.name);
-        let exit = std::process::Command::new("docker")
-            .args(&["cp", &idl_artifact, &out_file])
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .output()
-            .map_err(|e| anyhow::format_err!("{}", e.to_string()))?;
-        if !exit.status.success() {
-            return Ok(());
-        }
-    }
-
-    // Remove the docker image.
-    let exit = std::process::Command::new("docker")
-        .args(&["rm", container_name])
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .output()
-        .map_err(|e| anyhow::format_err!("{}", e.to_string()))?;
-    if !exit.status.success() {
-        std::process::exit(exit.status.code().unwrap_or(1));
-    }
-
+    // Done.
     Ok(())
 }
 
@@ -575,7 +615,7 @@ fn verify(cfg_override: &ConfigOverride, program_id: Pubkey) -> Result<()> {
 
     // Build the program we want to verify.
     let cur_dir = std::env::current_dir()?;
-    build(cfg_override, None, true, None)?;
+    build(cfg_override, None, true, None, None)?;
     std::env::set_current_dir(&cur_dir)?;
 
     // Verify binary.
@@ -1020,7 +1060,7 @@ fn test(
     with_workspace(cfg_override, |cfg, _cargo| {
         // Build if needed.
         if !skip_build {
-            build(cfg_override, None, false, None)?;
+            build(cfg_override, None, false, None, None)?;
         }
 
         // Run the deploy against the cluster in two cases:
@@ -1340,7 +1380,7 @@ fn launch(
     program_name: Option<String>,
 ) -> Result<()> {
     // Build and deploy.
-    build(cfg_override, None, verifiable, program_name.clone())?;
+    build(cfg_override, None, verifiable, program_name.clone(), None)?;
     let programs = _deploy(cfg_override, program_name)?;
 
     with_workspace(cfg_override, |cfg, _cargo| {
@@ -1746,7 +1786,7 @@ fn publish(cfg_override: &ConfigOverride, program_name: String) -> Result<()> {
     let anchor_package_bytes = serde_json::to_vec(&anchor_package)?;
 
     // Build the program before sending it to the server.
-    build(cfg_override, None, false, None)?;
+    build(cfg_override, None, true, Some(program_name.clone()), None)?;
 
     // Set directory to top of the workspace.
     let workspace_dir = cfg.path().parent().unwrap();

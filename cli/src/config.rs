@@ -13,7 +13,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-#[derive(Debug, Clap)]
+#[derive(Default, Debug, Clap)]
 pub struct ConfigOverride {
     /// Cluster override.
     #[clap(global = true, long = "provider.cluster")]
@@ -363,26 +363,15 @@ pub struct GenesisEntry {
     pub program: String,
 }
 
-// TODO: Just use the cargo_toml crate for this.
-pub fn extract_lib_name(path: impl AsRef<Path>) -> Result<String> {
-    let mut toml = File::open(path)?;
-    let mut contents = String::new();
-    toml.read_to_string(&mut contents)?;
-
-    let cargo_toml: toml::Value = contents.parse()?;
-
-    match cargo_toml {
-        toml::Value::Table(t) => match t.get("lib") {
-            None => Err(anyhow!("lib not found in Cargo.toml")),
-            Some(lib) => match lib
-                .get("name")
-                .ok_or_else(|| anyhow!("lib name not found in Cargo.toml"))?
-            {
-                toml::Value::String(n) => Ok(n.to_string()),
-                _ => Err(anyhow!("lib name must be a string")),
-            },
-        },
-        _ => Err(anyhow!("Invalid Cargo.toml")),
+pub fn extract_lib_name(cargo_toml: impl AsRef<Path>) -> Result<String> {
+    let cargo_toml = cargo_toml::Manifest::from_path(cargo_toml)?;
+    if cargo_toml.lib.is_some() && cargo_toml.lib.as_ref().unwrap().name.is_some() {
+        Ok(cargo_toml.lib.unwrap().name.unwrap())
+    } else {
+        Ok(cargo_toml
+            .package
+            .ok_or(anyhow!("Package section not provided"))?
+            .name)
     }
 }
 
@@ -473,6 +462,7 @@ impl AnchorPackage {
         let path = program_details
             .path
             .clone()
+            // TODO: use a default path if one isn't provided?
             .ok_or(anyhow!("Path to program binary not provided"))?;
         let address = program_details.address.to_string();
         Ok(Self {
