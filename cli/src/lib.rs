@@ -528,6 +528,16 @@ fn docker_build(
     );
 
     // Build the program in docker.
+    let manifest_path = pathdiff::diff_paths(
+        cargo_toml.canonicalize()?,
+        cfg.path().parent().unwrap().canonicalize()?,
+    )
+    .ok_or(anyhow!("Unable to diff paths"))?;
+    println!(
+        "Building {} manifest: {:?}",
+        binary_name,
+        manifest_path.display().to_string()
+    );
     let exit = std::process::Command::new("docker")
         .args(&[
             "run",
@@ -536,10 +546,10 @@ fn docker_build(
             "-v",
             &volume_mount,
             &image_name,
-            "anchor",
-            "build",
-            "-p",
-            &binary_name,
+            "cargo",
+            "build-bpf",
+            "--manifest-path",
+            &manifest_path.display().to_string(),
         ])
         .stdout(Stdio::inherit())
         .stderr(match stderr {
@@ -1815,11 +1825,17 @@ fn publish(cfg_override: &ConfigOverride, program_name: String) -> Result<()> {
 
     // All workspace programs.
     for path in cfg.get_program_list()? {
-        let relative_path = pathdiff::diff_paths(path, cfg.path().parent().unwrap())
+        let mut relative_path = pathdiff::diff_paths(path, cfg.path().parent().unwrap())
             .ok_or(anyhow!("Unable to diff paths"))?;
-        tar.append_dir_all(relative_path.clone(), relative_path)?;
-    }
 
+        // HACK for workspaces wtih single programs. Change this.
+        if relative_path.display().to_string() == "".to_string() {
+            relative_path = "src".into();
+        }
+        println!("BEFORE: {:?}", relative_path);
+        tar.append_dir_all(relative_path.clone(), relative_path)?;
+        println!("AFTER");
+    }
     tar.into_inner()?;
 
     // Upload the tarball to the server.
